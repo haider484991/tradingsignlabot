@@ -2,8 +2,8 @@ name: Stock Scanner
 
 on:
   schedule:
-    # Runs every 15 minutes during Indian market hours (3:45 AM - 10:00 AM UTC = 9:15 AM - 3:30 PM IST)
-    - cron: '*/15 3-10 * * 1-5'
+    # Runs every 5 minutes, 24/7 (for crypto markets that never close)
+    - cron: '*/5 * * * *'
   workflow_dispatch:  # Allows manual trigger
 
 jobs:
