@@ -28,6 +28,29 @@ Real-time market scanner with Telegram alerts. Runs continuously in the cloud.
      - `CHAT_ID` = your chat id
    - Click Deploy!
 
+## Quick Deploy to Render.com (FREE - 750 hrs/month)
+
+1. **Push to GitHub:**
+   ```bash
+   git add .
+   git commit -m "Add Render config"
+   git remote add origin https://github.com/YOUR_USERNAME/trading-scanner.git
+   git branch -M main
+   git push -u origin main
+   ```
+
+2. **Deploy to Render:**
+   - Go to [render.com](https://render.com)
+   - Click "New" → "Background Worker"
+   - Connect your GitHub repository
+   - Set Environment: **Python 3**
+   - Build Command: `pip install -r requirements.txt`
+   - Start Command: `python main.py`
+   - Add environment variables:
+     - `TELEGRAM_BOT_TOKEN` = your bot token
+     - `CHAT_ID` = your channel id
+   - Click "Create Background Worker"!
+
 ## Local Development
 
 ```bash
