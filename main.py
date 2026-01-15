@@ -9,6 +9,7 @@ NSE & Crypto Breakout Scanner - CLOUD READY
 
 import os
 import csv
+import json
 import time
 import requests
 import pandas as pd
@@ -44,27 +45,55 @@ RSI_THRESHOLD = 50
 alerted_symbols = set()
 alert_lock = threading.Lock()
 
+# Trade state file for persistence
+TRADE_STATE_FILE = "trade_state.json"
+
+# ============================================================================
+# TRADE STATE MANAGEMENT (matches Pine Script's var in_long/in_short)
+# ============================================================================
+def load_trade_state() -> dict:
+    """Load trade state from JSON file."""
+    try:
+        if os.path.exists(TRADE_STATE_FILE):
+            with open(TRADE_STATE_FILE, 'r') as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"⚠️ Error loading trade state: {e}")
+    return {}  # {symbol: 'LONG' or 'SHORT'}
+
+
+def save_trade_state(state: dict):
+    """Save trade state to JSON file."""
+    try:
+        with open(TRADE_STATE_FILE, 'w') as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        print(f"⚠️ Error saving trade state: {e}")
+
+
+# Global trade state
+trade_state = load_trade_state()
+trade_state_lock = threading.Lock()
+
 
 def load_symbols() -> list:
-    """Load symbols from CSV."""
+    """Load CRYPTO symbols only from CSV."""
     symbols = []
     try:
         with open('stocks.csv', 'r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
             for row in reader:
                 sym = row.get('symbol', '').strip()
-                if sym:
-                    if '-USD' in sym:
-                        symbols.append(sym)
-                    else:
-                        symbols.append(f"{sym}.NS")
+                if sym and '-USD' in sym:
+                    # Only load crypto symbols
+                    symbols.append(sym)
     except Exception as e:
         print(f"❌ Error loading symbols: {e}")
     return symbols
 
 
-def fetch_and_analyze(symbol: str) -> dict:
-    """Fetch data and analyze a single symbol."""
+def fetch_and_analyze_stock(symbol: str) -> dict:
+    """Fetch data and analyze a single STOCK symbol (Daily timeframe)."""
     try:
         ticker = yf.Ticker(symbol)
         df = ticker.history(period="50d", interval="1d")
@@ -97,10 +126,175 @@ def fetch_and_analyze(symbol: str) -> dict:
             'volume_ratio': round(yesterday['Volume'] / max(yesterday['Vol_SMA'], 1), 2),
             'conditions_met': conditions_met,
             'is_signal': conditions_met >= 3,
+            'signal_type': 'STOCK',
             'cond1': cond1, 'cond2': cond2, 'cond3': cond3, 'cond4': cond4
         }
     except:
         return None
+
+
+def fetch_and_analyze_crypto(symbol: str) -> dict:
+    """
+    Fetch data and analyze a CRYPTO symbol using NSE Bollinger Squeeze Pro strategy.
+    Uses 15-minute timeframe with:
+    - 5-bar squeeze lookback (ta.lowest(bb_width, 5) < 0.10)
+    - EMA200 trend filter
+    - Volume spike filter (1.5x avg)
+    - Exit at opposite band (stop) + 3% trailing profit
+    """
+    global trade_state
+    
+    try:
+        ticker = yf.Ticker(symbol)
+        # Fetch 15m data (max ~60 days available for 15m)
+        df = ticker.history(period="1mo", interval="15m")
+        
+        if df.empty or len(df) < 210:  # Need at least 210 bars for EMA200
+            return None
+        
+        # --- INDICATORS ---
+        # Bollinger Bands (length=20, mult=2.0)
+        df['BB_Mid'] = df['Close'].rolling(20).mean()
+        df['BB_Std'] = df['Close'].rolling(20).std()
+        df['BB_Upper'] = df['BB_Mid'] + (df['BB_Std'] * 2)
+        df['BB_Lower'] = df['BB_Mid'] - (df['BB_Std'] * 2)
+        
+        # BB Width
+        df['BB_Width'] = (df['BB_Upper'] - df['BB_Lower']) / df['BB_Mid']
+        
+        # Squeeze: ta.lowest(bb_width, 5) < 0.10 (5-bar lookback)
+        df['BB_Width_Min'] = df['BB_Width'].rolling(5).min()
+        df['Is_Squeezed'] = df['BB_Width_Min'] < 0.10
+        
+        # EMA 200
+        df['EMA200'] = df['Close'].ewm(span=200, adjust=False).mean()
+        
+        # Volume SMA (length=20)
+        df['Vol_SMA'] = df['Volume'].rolling(20).mean()
+        df['Vol_Spike'] = df['Volume'] > (df['Vol_SMA'] * 1.5)
+        
+        # Trend filters
+        df['Trend_Long'] = df['Close'] > df['EMA200']  # Bullish
+        df['Trend_Short'] = df['Close'] < df['EMA200']  # Bearish
+        
+        today = df.iloc[-1]
+        
+        # Get current position state
+        with trade_state_lock:
+            position_data = trade_state.get(symbol, None)
+        
+        # Position data format: {'type': 'LONG'/'SHORT', 'entry_price': X, 'high_since': Y}
+        in_long = position_data is not None and position_data.get('type') == 'LONG'
+        in_short = position_data is not None and position_data.get('type') == 'SHORT'
+        
+        # --- ENTRY SIGNALS ---
+        is_squeezed = today['Is_Squeezed']
+        vol_ok = today['Vol_Spike']
+        
+        # LONG: is_squeezed AND close > upper AND trend_long AND vol_ok
+        long_cond = (not in_long and not in_short and
+                     is_squeezed and 
+                     today['Close'] > today['BB_Upper'] and 
+                     today['Trend_Long'] and 
+                     vol_ok)
+        
+        # SHORT: is_squeezed AND close < lower AND trend_short AND vol_ok
+        short_cond = (not in_long and not in_short and
+                      is_squeezed and 
+                      today['Close'] < today['BB_Lower'] and 
+                      today['Trend_Short'] and 
+                      vol_ok)
+        
+        # --- EXIT SIGNALS ---
+        # For LONG: Stop at lower band OR 3% trailing profit hit
+        # For SHORT: Stop at upper band OR 3% trailing profit hit
+        exit_long = False
+        exit_short = False
+        trail_pct = 3.0  # 3% trailing profit
+        
+        if in_long:
+            entry_price = position_data.get('entry_price', today['Close'])
+            high_since = position_data.get('high_since', entry_price)
+            
+            # Update high since entry
+            if today['Close'] > high_since:
+                high_since = today['Close']
+                with trade_state_lock:
+                    trade_state[symbol]['high_since'] = high_since
+                    save_trade_state(trade_state)
+            
+            # Stop loss at lower band
+            stop_hit = today['Close'] < today['BB_Lower']
+            # Trailing profit: if price drops 3% from high
+            trail_stop = high_since * (1 - trail_pct/100)
+            trail_hit = today['Close'] < trail_stop
+            
+            exit_long = stop_hit or trail_hit
+        
+        if in_short:
+            entry_price = position_data.get('entry_price', today['Close'])
+            low_since = position_data.get('low_since', entry_price)
+            
+            # Update low since entry
+            if today['Close'] < low_since:
+                low_since = today['Close']
+                with trade_state_lock:
+                    trade_state[symbol]['low_since'] = low_since
+                    save_trade_state(trade_state)
+            
+            # Stop loss at upper band
+            stop_hit = today['Close'] > today['BB_Upper']
+            # Trailing profit: if price rises 3% from low
+            trail_stop = low_since * (1 + trail_pct/100)
+            trail_hit = today['Close'] > trail_stop
+            
+            exit_short = stop_hit or trail_hit
+        
+        # Determine signal type
+        signal_type = None
+        is_signal = False
+        
+        if long_cond:
+            signal_type = 'LONG'
+            is_signal = True
+        elif short_cond:
+            signal_type = 'SHORT'
+            is_signal = True
+        elif exit_long:
+            signal_type = 'EXIT_LONG'
+            is_signal = True
+        elif exit_short:
+            signal_type = 'EXIT_SHORT'
+            is_signal = True
+        
+        return {
+            'symbol': symbol,
+            'price': round(today['Close'], 2),
+            'ema200': round(today['EMA200'], 2),
+            'bb_upper': round(today['BB_Upper'], 2),
+            'bb_lower': round(today['BB_Lower'], 2),
+            'bb_mid': round(today['BB_Mid'], 2),
+            'volume_ratio': round(today['Volume'] / max(today['Vol_SMA'], 1), 2),
+            'is_squeezed': is_squeezed,
+            'is_signal': is_signal,
+            'signal_type': signal_type if is_signal else 'CRYPTO',
+            'current_position': position_data,
+            'conditions_met': 4 if is_signal else 0,
+            'cond1': is_squeezed,  # Squeeze active (5-bar lookback)
+            'cond2': vol_ok,  # Volume spike
+            'cond3': today['Trend_Long'] if signal_type == 'LONG' else today['Trend_Short'],  # Trend filter
+            'cond4': today['Close'] > today['BB_Upper'] if signal_type == 'LONG' else today['Close'] < today['BB_Lower']  # BB breakout
+        }
+    except Exception as e:
+        return None
+
+
+def fetch_and_analyze(symbol: str) -> dict:
+    """Route to the appropriate analyzer based on symbol type."""
+    if '-USD' in symbol:
+        return fetch_and_analyze_crypto(symbol)
+    else:
+        return fetch_and_analyze_stock(symbol)
 
 
 def calculate_rsi(series, length=14):
@@ -165,37 +359,114 @@ def scan_all_parallel(symbols: list) -> tuple:
 
 
 def process_signals(signals: list, near_signals: list):
-    """Process and send alerts for signals."""
-    global alerted_symbols
+    """Process and send alerts for signals. Updates trade state on entries/exits."""
+    global alerted_symbols, trade_state
     
     new_signals = []
     
+    # For EXIT signals, we don't check alerted_symbols (always alert exits)
     with alert_lock:
         for sig in signals:
-            if sig['symbol'] not in alerted_symbols:
+            signal_type = sig.get('signal_type')
+            symbol = sig['symbol']
+            
+            # EXIT signals should always be processed (not spam-filtered)
+            if signal_type in ['EXIT_LONG', 'EXIT_SHORT']:
                 new_signals.append(sig)
-                alerted_symbols.add(sig['symbol'])
+            # ENTRY signals check alerted_symbols to prevent spam
+            elif symbol not in alerted_symbols:
+                new_signals.append(sig)
+                alerted_symbols.add(symbol)
     
     if new_signals:
         print(f"\n🚨 {len(new_signals)} NEW SIGNALS!")
         
         for sig in new_signals:
-            msg = f"""🚨 *BREAKOUT ALERT*
+            signal_type = sig.get('signal_type')
+            symbol = sig['symbol']
+            
+            # Update trade state based on signal type
+            with trade_state_lock:
+                if signal_type == 'LONG':
+                    trade_state[symbol] = {
+                        'type': 'LONG',
+                        'entry_price': sig['price'],
+                        'high_since': sig['price']
+                    }
+                    save_trade_state(trade_state)
+                elif signal_type == 'SHORT':
+                    trade_state[symbol] = {
+                        'type': 'SHORT',
+                        'entry_price': sig['price'],
+                        'low_since': sig['price']
+                    }
+                    save_trade_state(trade_state)
+                elif signal_type in ['EXIT_LONG', 'EXIT_SHORT']:
+                    if symbol in trade_state:
+                        del trade_state[symbol]
+                        save_trade_state(trade_state)
+                    # Remove from alerted_symbols so new entries can be detected
+                    if symbol in alerted_symbols:
+                        alerted_symbols.discard(symbol)
+            
+            # Format message based on signal type
+            if signal_type == 'LONG':
+                stop_price = sig.get('bb_lower', 0)
+                trail_exit = round(sig['price'] * 0.97, 2)  # 3% below entry as trailing reference
+                msg = f"""🟢 *LONG ENTRY*
 
-📊 *{sig['symbol']}*
-💰 Price: ₹{sig['price']}
-📈 RSI: {sig['rsi']}
+📈 *{symbol}*
+
+💰 *Entry Price: ${sig['price']}*
+🛑 *Stop Loss: ${stop_price}* (Lower Band)
+📈 *Trail Exit: ${trail_exit}* (3% from high)
+
 📊 Volume: {sig['volume_ratio']}x avg
-✅ Conditions: {sig['conditions_met']}/4
-
-{'✅' if sig['cond1'] else '❌'} BB Breakout
-{'✅' if sig['cond2'] else '❌'} Volume Spike
-{'✅' if sig['cond3'] else '❌'} Price Up
-{'✅' if sig['cond4'] else '❌'} RSI Momentum
+📈 EMA200: ${sig.get('ema200', 'N/A')}
 
 ⏰ {datetime.now().strftime('%H:%M:%S')}"""
+
+            elif signal_type == 'SHORT':
+                stop_price = sig.get('bb_upper', 0)
+                trail_exit = round(sig['price'] * 1.03, 2)  # 3% above entry as trailing reference
+                msg = f"""🔴 *SHORT ENTRY*
+
+📉 *{symbol}*
+
+💰 *Entry Price: ${sig['price']}*
+🛑 *Stop Loss: ${stop_price}* (Upper Band)
+📉 *Trail Exit: ${trail_exit}* (3% from low)
+
+📊 Volume: {sig['volume_ratio']}x avg
+📈 EMA200: ${sig.get('ema200', 'N/A')}
+
+⏰ {datetime.now().strftime('%H:%M:%S')}"""
+
+            elif signal_type == 'EXIT_LONG':
+                entry_price = sig.get('current_position', {}).get('entry_price', 'N/A') if sig.get('current_position') else 'N/A'
+                msg = f"""⚪ *EXIT LONG*
+
+📊 *{symbol}*
+💰 *Entry was: ${entry_price}*
+💰 *Exit Price: ${sig['price']}*
+
+⏰ {datetime.now().strftime('%H:%M:%S')}"""
+
+            elif signal_type == 'EXIT_SHORT':
+                entry_price = sig.get('current_position', {}).get('entry_price', 'N/A') if sig.get('current_position') else 'N/A'
+                msg = f"""⚪ *EXIT SHORT*
+
+📊 *{symbol}*
+💰 *Entry was: ${entry_price}*
+💰 *Exit Price: ${sig['price']}*
+
+⏰ {datetime.now().strftime('%H:%M:%S')}"""
+            else:
+                continue  # Skip unknown signal types
             
-            print(f"   🚨 {sig['symbol']} - ₹{sig['price']}")
+            emoji = "🟢" if signal_type == 'LONG' else ("🔴" if signal_type == 'SHORT' else "⚪")
+            print(f"   {emoji} {symbol} - ${sig['price']} ({signal_type})")
+            
             if send_telegram(msg):
                 print(f"      📤 Telegram sent!")
             else:
